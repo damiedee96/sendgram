@@ -6,7 +6,6 @@ import "./mocks.js";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import type { Context, NextFunction } from "grammy";
 import { getDb } from "../db.js";
-
 // ---------------------------------------------------------------------------
 // Reset DB between tests
 // ---------------------------------------------------------------------------

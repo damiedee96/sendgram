@@ -17,9 +17,13 @@ export async function handleHelp(ctx: CommandContext<Context>): Promise<void> {
       `/balance — Check your USDC balance\n\n` +
 
       `/send <user\\_id> <amount>\n` +
-      `  Send USDC to another registered user\\.\n` +
+      `  Send USDC to a registered user by their numeric Telegram ID\\.\n` +
       `  If they haven't started the bot, a claim code is created\\.\n` +
+      `  A confirmation step is shown before any payment is sent\\.\n` +
       `  Example: /send 123456789 5\\.50\n\n` +
+
+      `/confirm\\_send <transfer\\_id>\n` +
+      `  Confirm and execute a payment staged by /send\\.\n\n` +
 
       `/claim <code>\n` +
       `  Claim a pending USDC transfer\\.\\.\n` +

@@ -4,7 +4,7 @@
  */
 
 import type { Context, NextFunction } from "grammy";
-import { checkRateLimit, acquireUserLock, releaseUserLock } from "../db.js";
+import { checkRateLimit, acquireUserLock, releaseUserLock, renewUserLock, USER_LOCK_TTL_SECONDS } from "../db.js";
 import { logger } from "../logger.js";
 
 /** Reject any message that isn't in a private chat. */
@@ -32,7 +32,9 @@ export async function rateLimitMiddleware(ctx: Context, next: NextFunction): Pro
 
 /**
  * One-in-flight-command-per-user guard.
- * Prevents double-spend races by serialising command execution per user.
+ * Lock TTL is USER_LOCK_TTL_SECONDS (90 s) — longer than the Stellar
+ * transaction timeout (30 s) plus margin. The lock is renewed every
+ * half-TTL while the command is running so it never expires mid-flight.
  */
 export async function userLockMiddleware(ctx: Context, next: NextFunction): Promise<void> {
   const userId = ctx.from?.id;
@@ -49,9 +51,16 @@ export async function userLockMiddleware(ctx: Context, next: NextFunction): Prom
     return;
   }
 
+  // Renew the lock every half-TTL so a slow Stellar response doesn't expire it
+  const renewIntervalMs = Math.floor((USER_LOCK_TTL_SECONDS / 2) * 1000);
+  const renewTimer = setInterval(() => {
+    renewUserLock(userId);
+  }, renewIntervalMs);
+
   try {
     await next();
   } finally {
+    clearInterval(renewTimer);
     releaseUserLock(userId);
   }
 }

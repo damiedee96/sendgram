@@ -18,6 +18,7 @@ import { handleClaim } from "./commands/claim.js";
 import { handleCancel } from "./commands/cancel.js";
 import { handleHistory } from "./commands/history.js";
 import { handleHelp } from "./commands/help.js";
+import { handleConfirmSend } from "./commands/confirm_send.js";
 import { logger } from "../logger.js";
 
 export function createBot(): Bot {
@@ -36,6 +37,7 @@ export function createBot(): Bot {
   // Commands that could mutate state use the user lock
   bot.command("balance", userLockMiddleware, handleBalance);
   bot.command("send", userLockMiddleware, handleSend);
+  bot.command("confirm_send", userLockMiddleware, handleConfirmSend);
   bot.command("claim", userLockMiddleware, handleClaim);
   bot.command("cancel", userLockMiddleware, handleCancel);
   bot.command("history", userLockMiddleware, handleHistory);

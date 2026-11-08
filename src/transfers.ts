@@ -1,6 +1,12 @@
 /**
  * SendGram v0.1 — CUSTODIAL DEMO
  * Transfer business logic: direct sends, pending claims, cancel, expiry.
+ *
+ * Atomic state transitions:
+ *   pending → claiming  (atomicStatusTransition; exactly one winner in a race)
+ *   claiming → completed (on payment success)
+ *   claiming → pending   (on payment failure — revert so sender can retry)
+ *   pending → cancelled  (atomicStatusTransition; only the sender)
  */
 
 import { randomUUID } from "node:crypto";
@@ -8,9 +14,10 @@ import {
   createTransfer,
   findTransferByClaimHash,
   findTransfer,
-  updateTransferStatus,
+  atomicStatusTransition,
   getTransferHistory,
   dailySentAmount,
+  reservedAmount,
   withTransaction,
   expirePendingTransfers,
   type TransferRow,
@@ -36,7 +43,7 @@ import { logger } from "./logger.js";
 export type { TransferRow };
 
 export type SendResult =
-  | { type: "direct"; txHash: string; amount: string; recipientId: number }
+  | { type: "direct_pending_confirm"; recipientId: number; amount: string; transferId: string }
   | { type: "pending"; claimCode: string; amount: string; transferId: string; expiresAt: Date };
 
 // ---------------------------------------------------------------------------
@@ -44,85 +51,69 @@ export type SendResult =
 // ---------------------------------------------------------------------------
 
 /**
- * Initiate a send from senderId to recipientHandle.
- * recipientHandle may be a Telegram user ID number (already resolved by the command handler).
+ * Validate and stage a transfer. For direct sends this creates the DB record
+ * in "pending" state — the bot must call confirmDirectTransfer() after the user
+ * confirms. For claim-code sends it creates the pending+code record.
  */
 export async function initiateTransfer(
   senderId: number,
-  recipientUserId: number | null, // null = recipient not registered
+  recipientUserId: number | null, // null = recipient not registered; create claim code
   rawAmount: string
 ): Promise<SendResult> {
   // Parse and validate amount
   const amountStroops = parseAmount(rawAmount);
 
-  // Daily cap check
+  // Daily cap check (includes pending + claiming + completed in last 24h)
   const dailySent = dailySentAmount(senderId);
   const dailyCap = BigInt(config.maxDailyAmount) * USDC_STROOP;
   if (dailySent + amountStroops > dailyCap) {
     throw new AmountError(
       `This transfer would exceed your daily limit of ${config.maxDailyAmount} USDC. ` +
-        `You have already sent ${formatAmountTrimmed(dailySent)} USDC today.`
+        `You have already sent or reserved ${formatAmountTrimmed(dailySent)} USDC today.`
     );
   }
 
-  // Balance check
   const senderRow = findUser(senderId);
   if (!senderRow) throw new Error("Sender wallet not found. Use /start first.");
 
-  const balance = await getUsdcBalance(senderRow.public_key);
-  if (balance < amountStroops) {
-    throw new InsufficientBalanceError(balance, amountStroops);
+  // Available balance = on-chain balance minus pending/claiming reservations
+  const onChainBalance = await getUsdcBalance(senderRow.public_key);
+  const reserved = reservedAmount(senderId);
+  const available = onChainBalance > reserved ? onChainBalance - reserved : 0n;
+  if (available < amountStroops) {
+    throw new InsufficientBalanceError(available, amountStroops);
   }
 
   const amountStr = formatAmountTrimmed(amountStroops);
+  const transferId = randomUUID();
 
   if (recipientUserId !== null) {
-    // --- Direct transfer ---
+    // Verify recipient wallet exists
     const recipientRow = findUser(recipientUserId);
     if (!recipientRow) {
       throw new Error("Recipient wallet not found. They must use /start first.");
     }
 
-    const idempotencyKey = randomUUID();
-    const transferId = randomUUID();
-    const secretKey = await getSecretKey(senderId);
-
-    let txHash: string;
-    try {
-      txHash = await sendUsdc(
-        senderRow.public_key,
-        secretKey,
-        recipientRow.public_key,
-        amountStroops,
-        `SendGram ${transferId.slice(0, 8)}`
-      );
-    } catch (err) {
-      logger.error({ err: String(err), transferId }, "Stellar payment failed");
-      throw err;
-    }
-
+    // Create the record in pending state — confirmed and sent after user confirmation
     withTransaction(() => {
       createTransfer({
         id: transferId,
         sender_id: senderId,
         recipient_id: recipientUserId,
         amount_stroops: amountStroops.toString(),
-        status: "completed",
+        status: "pending",
         claim_code_hash: null,
         expires_at: null,
-        stellar_tx_hash: txHash,
-        idempotency_key: idempotencyKey,
+        stellar_tx_hash: null,
       });
     });
 
-    logger.info({ transferId, txHash, amountStr }, "Direct transfer completed");
-    return { type: "direct", txHash, amount: amountStr, recipientId: recipientUserId };
+    logger.info({ transferId, amountStr, recipientUserId }, "Direct transfer staged, awaiting confirmation");
+    return { type: "direct_pending_confirm", recipientId: recipientUserId, amount: amountStr, transferId };
   } else {
-    // --- Pending transfer with claim code ---
+    // Pending transfer with claim code
     const claimCode = await generateClaimCode();
     const codeHash = hashClaimCode(claimCode);
-    const transferId = randomUUID();
-    const idempotencyKey = randomUUID();
     const expiresAt = Math.floor(Date.now() / 1000) + config.claimExpiryHours * 3600;
 
     withTransaction(() => {
@@ -135,7 +126,6 @@ export async function initiateTransfer(
         claim_code_hash: codeHash,
         expires_at: expiresAt,
         stellar_tx_hash: null,
-        idempotency_key: idempotencyKey,
       });
     });
 
@@ -148,6 +138,71 @@ export async function initiateTransfer(
       expiresAt: new Date(expiresAt * 1000),
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Confirm direct transfer (after user confirmation step)
+// ---------------------------------------------------------------------------
+export interface DirectSendResult {
+  txHash: string;
+  amount: string;
+  recipientId: number;
+}
+
+/**
+ * Execute the on-chain payment for a direct transfer that was staged by initiateTransfer().
+ * Uses the atomic pending→claiming transition to prevent double execution.
+ */
+export async function confirmDirectTransfer(
+  senderId: number,
+  transferId: string
+): Promise<DirectSendResult> {
+  const transfer = findTransfer(transferId);
+  if (!transfer) throw new Error("Staged transfer not found.");
+  if (transfer.sender_id !== senderId) throw new Error("Transfer does not belong to sender.");
+  if (transfer.recipient_id === null) throw new Error("Transfer has no recipient.");
+  if (transfer.claim_code_hash !== null) throw new Error("Transfer is a claim-code transfer, not direct.");
+
+  const recipientRow = findUser(transfer.recipient_id);
+  if (!recipientRow) throw new Error("Recipient wallet not found.");
+
+  const senderRow = findUser(senderId);
+  if (!senderRow) throw new Error("Sender wallet not found.");
+
+  const amountStroops = BigInt(transfer.amount_stroops);
+  const amountStr = formatAmountTrimmed(amountStroops);
+
+  // Atomically claim the pending slot — prevents double execution
+  const won = atomicStatusTransition(transferId, "pending", "claiming");
+  if (!won) {
+    throw new Error("Transfer is no longer pending (may have been cancelled or already processed).");
+  }
+
+  const secretKey = await getSecretKey(senderId);
+
+  let txHash: string;
+  try {
+    txHash = await sendUsdc(
+      senderRow.public_key,
+      secretKey,
+      recipientRow.public_key,
+      amountStroops,
+      `SendGram ${transferId.slice(0, 8)}`
+    );
+  } catch (err) {
+    // Revert to pending so the sender can retry or cancel
+    atomicStatusTransition(transferId, "claiming", "pending");
+    logger.error({ err: String(err), transferId }, "Direct payment failed — reverted to pending");
+    throw err;
+  }
+
+  atomicStatusTransition(transferId, "claiming", "completed", {
+    recipientId: transfer.recipient_id,
+    stellarTxHash: txHash,
+  });
+
+  logger.info({ transferId, txHash, amountStr }, "Direct transfer completed");
+  return { txHash, amount: amountStr, recipientId: transfer.recipient_id };
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +219,6 @@ export async function claimTransfer(
   claimantUserId: number,
   rawCode: string
 ): Promise<ClaimResult> {
-  // Normalise code: lowercase hex only
   const code = rawCode.trim().toLowerCase();
   if (!/^[0-9a-f]{32}$/.test(code)) {
     throw new ClaimError("Invalid claim code format. It should be 32 hex characters.");
@@ -172,7 +226,7 @@ export async function claimTransfer(
 
   const codeHash = hashClaimCode(code);
 
-  // Expire any stale transfers first
+  // Expire stale transfers first (never touches 'claiming')
   expirePendingTransfers();
 
   const transfer = findTransferByClaimHash(codeHash);
@@ -189,32 +243,30 @@ export async function claimTransfer(
   if (transfer.status === "completed") {
     throw new ClaimError("This claim code has already been used.");
   }
+  if (transfer.status === "claiming") {
+    throw new ClaimError("This transfer is currently being processed. Try again in a moment.");
+  }
   if (transfer.status !== "pending") {
     throw new ClaimError("This transfer is not claimable.");
   }
 
   // Check expiry
   if (transfer.expires_at && Math.floor(Date.now() / 1000) > transfer.expires_at) {
-    updateTransferStatus(transfer.id, "expired");
+    atomicStatusTransition(transfer.id, "pending", "expired");
     throw new ClaimError("This claim code has expired.");
   }
 
-  // Can't claim your own transfer — but this is a WARNING, not a hard block
-  // (per spec: "anyone holding the code can claim it")
-  // We do prevent self-claim to avoid confusing accounting
   if (transfer.sender_id === claimantUserId) {
     throw new ClaimError(
       "You cannot claim your own transfer. Ask the recipient to /claim it, or /cancel it."
     );
   }
 
-  // Get recipient wallet
   const recipientRow = findUser(claimantUserId);
   if (!recipientRow) {
     throw new ClaimError("You need a wallet first. Use /start to create one.");
   }
 
-  // Get sender wallet
   const senderRow = findUser(transfer.sender_id);
   if (!senderRow) {
     throw new Error("Sender wallet missing — cannot complete transfer.");
@@ -222,10 +274,23 @@ export async function claimTransfer(
 
   const amountStroops = BigInt(transfer.amount_stroops);
 
-  // Balance re-check at claim time
-  const balance = await getUsdcBalance(senderRow.public_key);
-  if (balance < amountStroops) {
-    throw new InsufficientBalanceError(balance, amountStroops);
+  // Reserve funds check: available = on-chain minus all other pending/claiming
+  const onChainBalance = await getUsdcBalance(senderRow.public_key);
+  const otherReserved = reservedAmount(transfer.sender_id);
+  // This transfer itself is still 'pending' so otherReserved includes it;
+  // available for this claim = balance minus (reserved - this amount)
+  const reservedExcludingThis = otherReserved > amountStroops ? otherReserved - amountStroops : 0n;
+  const available = onChainBalance > reservedExcludingThis ? onChainBalance - reservedExcludingThis : 0n;
+  if (available < amountStroops) {
+    throw new InsufficientBalanceError(available, amountStroops);
+  }
+
+  // Atomically move to 'claiming' — exactly one concurrent claimer wins
+  const won = atomicStatusTransition(transfer.id, "pending", "claiming", {
+    recipientId: claimantUserId,
+  });
+  if (!won) {
+    throw new ClaimError("This transfer was just claimed or cancelled by someone else.");
   }
 
   const secretKey = await getSecretKey(transfer.sender_id);
@@ -241,15 +306,15 @@ export async function claimTransfer(
       `Claim ${transfer.id.slice(0, 8)}`
     );
   } catch (err) {
-    logger.error({ err: String(err), transferId: transfer.id }, "Claim payment failed");
+    // Revert to pending — claim code can be retried
+    atomicStatusTransition(transfer.id, "claiming", "pending");
+    logger.error({ err: String(err), transferId: transfer.id }, "Claim payment failed — reverted to pending");
     throw err;
   }
 
-  withTransaction(() => {
-    updateTransferStatus(transfer.id, "completed", {
-      recipientId: claimantUserId,
-      stellarTxHash: txHash,
-    });
+  atomicStatusTransition(transfer.id, "claiming", "completed", {
+    recipientId: claimantUserId,
+    stellarTxHash: txHash,
   });
 
   logger.info({ transferId: transfer.id, txHash, amountStr }, "Transfer claimed");
@@ -285,16 +350,22 @@ export async function cancelTransfer(
   if (transfer.status === "expired") {
     throw new CancelError("This transfer has already expired.");
   }
+  if (transfer.status === "claiming") {
+    throw new CancelError(
+      "This transfer is currently being claimed. It cannot be cancelled right now."
+    );
+  }
   if (transfer.status !== "pending") {
     throw new CancelError("This transfer cannot be cancelled.");
   }
-  if (transfer.claim_code_hash === null) {
-    throw new CancelError("Direct transfers cannot be cancelled after completion.");
-  }
 
-  withTransaction(() => {
-    updateTransferStatus(transferId, "cancelled");
-  });
+  // Atomically move from pending to cancelled — prevents cancel-vs-claim race
+  const won = atomicStatusTransition(transferId, "pending", "cancelled");
+  if (!won) {
+    throw new CancelError(
+      "This transfer was just claimed or expired. It cannot be cancelled."
+    );
+  }
 
   const amountStr = formatAmountTrimmed(BigInt(transfer.amount_stroops));
   logger.info({ transferId, amountStr }, "Transfer cancelled by sender");

@@ -7,6 +7,13 @@
  *   transfers     — all transfer records (direct + pending claim)
  *   rate_limits   — sliding-window counters for rate limiting
  *   user_locks    — advisory lock table for one-in-flight-command-per-user
+ *
+ * Transfer state machine:
+ *   pending → claiming  (atomic UPDATE WHERE status='pending'; claim or cancel)
+ *   claiming → completed (payment confirmed)
+ *   claiming → pending   (payment failed — revert)
+ *   pending → cancelled  (atomic UPDATE WHERE status='pending'; only sender)
+ *   pending → expired    (background job; expiry time passed)
  */
 
 import Database from "better-sqlite3";
@@ -17,7 +24,7 @@ import { config } from "./config.js";
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-export type TransferStatus = "pending" | "completed" | "cancelled" | "expired";
+export type TransferStatus = "pending" | "claiming" | "completed" | "cancelled" | "expired";
 
 export interface UserRow {
   user_id: number;          // Telegram user ID (bigint stored as INTEGER)
@@ -30,12 +37,11 @@ export interface TransferRow {
   id: string;               // UUID v4
   sender_id: number;
   recipient_id: number | null;  // null until claimed
-  amount_stroops: string;   // store as TEXT to avoid JS float precision issues (7 decimal USDC)
+  amount_stroops: string;   // TEXT to avoid JS float precision issues (7 decimal USDC)
   status: TransferStatus;
   claim_code_hash: string | null;
   expires_at: number | null;    // Unix timestamp; null = direct (no code)
   stellar_tx_hash: string | null;
-  idempotency_key: string;      // unique per operation attempt
   created_at: number;
   updated_at: number;
 }
@@ -62,6 +68,11 @@ export function getDb(): Database.Database {
   return _db;
 }
 
+// For tests: allow resetting the singleton (in-memory dbs)
+export function _resetDb(): void {
+  _db = null;
+}
+
 // ---------------------------------------------------------------------------
 // Migrations
 // ---------------------------------------------------------------------------
@@ -84,11 +95,10 @@ function applyMigrations(db: Database.Database): void {
       recipient_id      INTEGER,
       amount_stroops    TEXT    NOT NULL,
       status            TEXT    NOT NULL DEFAULT 'pending'
-                          CHECK(status IN ('pending','completed','cancelled','expired')),
+                          CHECK(status IN ('pending','claiming','completed','cancelled','expired')),
       claim_code_hash   TEXT    UNIQUE,
       expires_at        INTEGER,
       stellar_tx_hash   TEXT,
-      idempotency_key   TEXT    NOT NULL UNIQUE,
       created_at        INTEGER NOT NULL DEFAULT (unixepoch()),
       updated_at        INTEGER NOT NULL DEFAULT (unixepoch()),
       FOREIGN KEY(sender_id) REFERENCES users(user_id)
@@ -150,14 +160,16 @@ export function findUserByPublicKey(publicKey: string): UserRow | undefined {
 // ---------------------------------------------------------------------------
 // Transfers
 // ---------------------------------------------------------------------------
-export function createTransfer(transfer: Omit<TransferRow, "created_at" | "updated_at">): TransferRow {
+export function createTransfer(
+  transfer: Omit<TransferRow, "created_at" | "updated_at">
+): TransferRow {
   const db = getDb();
   const now = Math.floor(Date.now() / 1000);
   db.prepare(`
     INSERT INTO transfers
       (id, sender_id, recipient_id, amount_stroops, status, claim_code_hash,
-       expires_at, stellar_tx_hash, idempotency_key, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       expires_at, stellar_tx_hash, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     transfer.id,
     transfer.sender_id,
@@ -167,7 +179,6 @@ export function createTransfer(transfer: Omit<TransferRow, "created_at" | "updat
     transfer.claim_code_hash ?? null,
     transfer.expires_at ?? null,
     transfer.stellar_tx_hash ?? null,
-    transfer.idempotency_key,
     now,
     now
   );
@@ -190,27 +201,35 @@ export function findTransferByClaimHash(hash: string): TransferRow | undefined {
     .get(hash);
 }
 
-export function updateTransferStatus(
+/**
+ * Atomically move a transfer from `fromStatus` to `toStatus`.
+ * Returns true if exactly one row was updated; false if the row was already
+ * in a different state (lost the race).
+ */
+export function atomicStatusTransition(
   id: string,
-  status: TransferStatus,
+  fromStatus: TransferStatus,
+  toStatus: TransferStatus,
   extra: { recipientId?: number; stellarTxHash?: string } = {}
-): void {
+): boolean {
   const db = getDb();
   const now = Math.floor(Date.now() / 1000);
-  db.prepare(`
+  const result = db.prepare(`
     UPDATE transfers
     SET status = ?,
         recipient_id = COALESCE(?, recipient_id),
         stellar_tx_hash = COALESCE(?, stellar_tx_hash),
         updated_at = ?
-    WHERE id = ?
+    WHERE id = ? AND status = ?
   `).run(
-    status,
+    toStatus,
     extra.recipientId ?? null,
     extra.stellarTxHash ?? null,
     now,
-    id
+    id,
+    fromStatus
   );
+  return result.changes === 1;
 }
 
 export function getTransferHistory(userId: number, limit = 10): TransferRow[] {
@@ -226,8 +245,28 @@ export function getTransferHistory(userId: number, limit = 10): TransferRow[] {
 }
 
 /**
+ * Sum of USDC (in stroops) reserved by a sender:
+ * status IN ('pending', 'claiming') in the past 24 hours.
+ * Used for daily cap and available-balance checks.
+ */
+export function reservedAmount(userId: number): bigint {
+  const db = getDb();
+  const cutoff = Math.floor(Date.now() / 1000) - 86400;
+  const row = db
+    .prepare<[number, number], { total: string | null }>(`
+      SELECT SUM(CAST(amount_stroops AS INTEGER)) AS total
+      FROM transfers
+      WHERE sender_id = ?
+        AND status IN ('pending', 'claiming')
+        AND created_at >= ?
+    `)
+    .get(userId, cutoff);
+  return BigInt(row?.total ?? "0");
+}
+
+/**
  * Sum of USDC (in stroops) sent by a user in the past 24 hours
- * for status = 'completed' or 'pending'.
+ * for status = 'completed', 'pending', or 'claiming' (all reserved or spent).
  */
 export function dailySentAmount(userId: number): bigint {
   const db = getDb();
@@ -237,14 +276,14 @@ export function dailySentAmount(userId: number): bigint {
       SELECT SUM(CAST(amount_stroops AS INTEGER)) AS total
       FROM transfers
       WHERE sender_id = ?
-        AND status IN ('completed', 'pending')
+        AND status IN ('completed', 'pending', 'claiming')
         AND created_at >= ?
     `)
     .get(userId, cutoff);
   return BigInt(row?.total ?? "0");
 }
 
-/** Expire pending transfers past their expiry time. */
+/** Expire pending transfers past their expiry time. Does NOT expire 'claiming'. */
 export function expirePendingTransfers(): number {
   const db = getDb();
   const now = Math.floor(Date.now() / 1000);
@@ -294,11 +333,19 @@ export function checkRateLimit(userId: number): boolean {
 // ---------------------------------------------------------------------------
 // User locks (one in-flight command per user)
 // ---------------------------------------------------------------------------
+
+/**
+ * Lock expiry: longer than the Stellar transaction timeout (30 s) plus margin.
+ * The Stellar SDK uses a 30-second transaction timeout; we use 90 s so the
+ * lock outlives any in-flight payment.
+ */
+export const USER_LOCK_TTL_SECONDS = 90;
+
 export function acquireUserLock(userId: number): boolean {
   const db = getDb();
   const now = Math.floor(Date.now() / 1000);
-  // Release stale locks older than 30 seconds
-  db.prepare("DELETE FROM user_locks WHERE locked_at < ?").run(now - 30);
+  // Release stale locks older than TTL
+  db.prepare("DELETE FROM user_locks WHERE locked_at < ?").run(now - USER_LOCK_TTL_SECONDS);
   try {
     db.prepare(
       "INSERT INTO user_locks (user_id, locked_at) VALUES (?, ?)"
@@ -307,6 +354,16 @@ export function acquireUserLock(userId: number): boolean {
   } catch {
     return false; // UNIQUE constraint → already locked
   }
+}
+
+/**
+ * Refresh the timestamp on an existing lock so it doesn't expire mid-command.
+ * Should be called periodically for long-running operations.
+ */
+export function renewUserLock(userId: number): void {
+  const db = getDb();
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare("UPDATE user_locks SET locked_at = ? WHERE user_id = ?").run(now, userId);
 }
 
 export function releaseUserLock(userId: number): void {

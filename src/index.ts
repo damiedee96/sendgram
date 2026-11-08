@@ -4,7 +4,7 @@
  *
  * ⚠️  CUSTODIAL DEMO: This software holds users' testnet wallet keys.
  *     It is NOT audited and NOT suitable for real funds.
- *     See LIMITATIONS.md for full details.
+ *     See docs/LIMITATIONS.md for full details.
  */
 
 // Config must be imported first — it hard-fails on non-testnet

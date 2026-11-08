@@ -3,7 +3,7 @@
 > ⚠️ **CUSTODIAL DEMO — TESTNET ONLY — NOT AUDITED**
 >
 > This bot holds testnet wallet keys. Do NOT use for real funds.
-> See [LIMITATIONS.md](./LIMITATIONS.md) for full details.
+> See [docs/LIMITATIONS.md](./docs/LIMITATIONS.md) for full details.
 
 A Telegram bot for USDC transfers on the **Stellar Testnet**.
 
@@ -11,7 +11,8 @@ A Telegram bot for USDC transfers on the **Stellar Testnet**.
 
 - `/start` — Create a custodial testnet wallet (funded via friendbot + USDC trustline)
 - `/balance` — Check USDC balance
-- `/send <user_id> <amount>` — Send USDC directly, or create a claim code if the recipient hasn't registered
+- `/send <user_id> <amount>` — Stage a transfer to a registered user (numeric ID only), or create a claim code if the recipient hasn't registered. Shows a confirmation prompt before payment.
+- `/confirm_send <transfer_id>` — Execute the payment after confirming
 - `/claim <code>` — Claim a pending transfer (anyone with the code can claim it)
 - `/cancel <transfer_id>` — Cancel an unclaimed transfer
 - `/history` — Last 10 transfers
@@ -30,14 +31,21 @@ npm install
 
 # 2. Configure environment
 cp .env.example .env
-# Edit .env — at minimum set BOT_TOKEN and generate an ENCRYPTION_KEY_HEX
-
-# Generate ENCRYPTION_KEY_HEX:
+# Edit .env — at minimum set BOT_TOKEN and STELLAR_NETWORK=testnet,
+# and generate ENCRYPTION_KEY_HEX:
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
-# 3. Run
+# 3. Type-check
+npm run build
+
+# 4. Run tests
+npm test
+
+# 5. Start the bot
 npm start
 ```
+
+Steps 3 and 4 were verified locally before this README was written.
 
 ## Environment Variables
 
@@ -71,32 +79,37 @@ npm run test:live
 
 ```
 src/
-  index.ts          — Entry point
-  config.ts         — Env validation (hard-fails on non-testnet)
-  crypto.ts         — XChaCha20-Poly1305 wallet encryption (libsodium)
-  db.ts             — SQLite schema + queries (better-sqlite3)
-  stellar.ts        — Stellar SDK: keypairs, payments, balance
-  wallet.ts         — Wallet creation and secret key access
-  transfers.ts      — Transfer business logic (send/claim/cancel)
-  expiry.ts         — Background job to expire old pending transfers
-  logger.ts         — Structured logger (redacts secrets)
+  index.ts             — Entry point
+  config.ts            — Env validation (hard-fails on non-testnet)
+  crypto.ts            — XChaCha20-Poly1305 encryption; user ID bound as AAD
+  db.ts                — SQLite schema, queries, atomic state transitions
+  stellar.ts           — Stellar SDK: keypairs, payments, balance
+  wallet.ts            — Wallet creation and secret key access
+  transfers.ts         — Transfer state machine (send/confirm/claim/cancel)
+  expiry.ts            — Background job to expire old pending transfers
+  logger.ts            — Structured logger (redacts secrets)
   bot/
-    index.ts        — grammY bot setup
-    middleware.ts   — Private-chat guard, rate limiting, user locks
-    commands/       — One file per Telegram command
-    utils.ts        — MarkdownV2 escape helper
-  tests/            — Vitest test suite
+    index.ts           — grammY bot setup
+    middleware.ts      — Private-chat guard, rate limiting, user locks (90 s TTL)
+    commands/          — One file per Telegram command
+    utils.ts           — MarkdownV2 escape helper
+  tests/               — Vitest test suite (92 tests)
+docs/
+  ROLES.md             — Actors, trust model, state machine
+  DECISIONS.md         — Architecture decision records
+  AUTHORIZATION.md     — What each actor can do and how it's enforced
+  LIMITATIONS.md       — Known risks and next steps
 ```
 
 ## Testnet USDC
 
-The Circle testnet USDC issuer used is:
+The Circle testnet USDC issuer:
 ```
 GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
 ```
 
-Source: [Circle Developer Docs](https://developers.circle.com/stablecoins/quickstarts/transfer-usdc-stellar) and [Stellar Developer Docs](https://developers.stellar.org/docs/platforms/anchor-platform/sep-guide/sep6/configuration).
+Sources: [Circle Developer Docs](https://developers.circle.com/stablecoins/quickstarts/transfer-usdc-stellar) · [Stellar Developer Docs](https://developers.stellar.org/docs/platforms/anchor-platform/sep-guide/sep6/configuration).
 
 ## Limitations
 
-See [LIMITATIONS.md](./LIMITATIONS.md).
+See [docs/LIMITATIONS.md](./docs/LIMITATIONS.md).

@@ -1,6 +1,7 @@
 /**
  * SendGram v0.1 — Test Mocks
  * Shared mock factories for Telegram contexts and Stellar operations.
+ * Import this file FIRST in every test to set process.env before config loads.
  */
 
 import { vi } from "vitest";
@@ -47,7 +48,7 @@ export function makeMockCtx(userId: number, match = ""): MockCtx {
 // Mock Stellar API
 // ---------------------------------------------------------------------------
 export const mockStellarSendUsdc: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue("mocktxhash123");
-export const mockStellarGetUsdcBalance: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue(50_000_0000n);
+export const mockStellarGetUsdcBalance: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue(50_0000000n);
 export const mockStellarSetupNewWallet: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue(undefined);
 export const mockStellarGenerateKeypair: ReturnType<typeof vi.fn> = vi.fn().mockReturnValue({
   publicKey: "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGCAIE1XFHX7ZIILNXXULB",
@@ -57,7 +58,7 @@ export const mockStellarGenerateKeypair: ReturnType<typeof vi.fn> = vi.fn().mock
 export function resetMocks(): void {
   vi.resetAllMocks();
   mockStellarSendUsdc.mockResolvedValue("mocktxhash123");
-  mockStellarGetUsdcBalance.mockResolvedValue(50_000_0000n);
+  mockStellarGetUsdcBalance.mockResolvedValue(50_0000000n); // 50 USDC
   mockStellarSetupNewWallet.mockResolvedValue(undefined);
   mockStellarGenerateKeypair.mockReturnValue({
     publicKey: "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGCAIE1XFHX7ZIILNXXULB",

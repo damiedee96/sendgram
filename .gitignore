@@ -1,3 +1,6 @@
+# Kiro IDE — never commit
+.kiro/
+
 # Environment — NEVER commit real secrets
 .env
 .env.local
@@ -12,6 +15,7 @@ data/
 # Build output
 dist/
 *.js.map
+*.tsbuildinfo
 
 # Node
 node_modules/

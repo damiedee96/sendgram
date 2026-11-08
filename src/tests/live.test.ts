@@ -60,8 +60,8 @@ beforeAll(async () => {
   console.log("Funding Bob:", bobPub);
   await setupNewWallet(bobPub, bob.secretKey);
 
-  createUser(aliceId, alicePub, await encryptSecretKey(aliceSec));
-  createUser(bobId, bobPub, await encryptSecretKey(bob.secretKey));
+  createUser(aliceId, alicePub, await encryptSecretKey(aliceSec, aliceId));
+  createUser(bobId, bobPub, await encryptSecretKey(bob.secretKey, bobId));
 }, TIMEOUT * 2);
 
 describe("live testnet — balance", () => {

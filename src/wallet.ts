@@ -37,7 +37,9 @@ async function createWallet(userId: number): Promise<Wallet> {
   const { publicKey, secretKey } = generateKeypair();
   logger.info({ userId, publicKey }, "Creating new custodial wallet");
 
-  const encryptedSecret = await encryptSecretKey(secretKey);
+  // Bind the ciphertext to this userId via AAD — a blob encrypted for user A
+  // cannot be decrypted as user B's key.
+  const encryptedSecret = await encryptSecretKey(secretKey, userId);
 
   // Fund and add trustline before persisting — if this fails, no DB entry
   await setupNewWallet(publicKey, secretKey);
@@ -56,7 +58,7 @@ async function createWallet(userId: number): Promise<Wallet> {
 export async function getSecretKey(userId: number): Promise<string> {
   const row = findUser(userId);
   if (!row) throw new Error(`No wallet found for user ${userId}`);
-  return decryptSecretKey(row.encrypted_secret);
+  return decryptSecretKey(row.encrypted_secret, userId);
 }
 
 /** Return the UserRow if the wallet exists, else undefined. */
