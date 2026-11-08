@@ -1,0 +1,30 @@
+{
+  "name": "sendgram",
+  "version": "0.1.0",
+  "description": "SendGram — CUSTODIAL DEMO Telegram bot for USDC transfers on Stellar TESTNET",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run",
+    "test:live": "vitest run --reporter=verbose src/tests/live.test.ts"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "17.4.0",
+    "better-sqlite3": "13.0.3",
+    "grammy": "1.46.0",
+    "libsodium-wrappers": "0.8.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "26.6.6",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}
