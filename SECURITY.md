@@ -11,7 +11,7 @@ Use one of the following channels:
 
 1. **GitHub private vulnerability reporting** — open a [private security advisory](https://github.com/damiedee96/sendgram/security/advisories/new) on this repository (requires a GitHub account).
 
-2. **Email** — send details to `<SECURITY CONTACT>`.
+2. **Email** — send details to `mdeelive@gmail.com`.
 
 Please include:
 - A description of the vulnerability and the potential impact
