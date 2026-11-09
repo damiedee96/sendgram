@@ -4,6 +4,8 @@
  * Import this file FIRST in every test to set process.env before config loads.
  */
 
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { vi } from "vitest";
 
 // ---------------------------------------------------------------------------
@@ -12,7 +14,10 @@ import { vi } from "vitest";
 process.env["STELLAR_NETWORK"] = "testnet";
 process.env["BOT_TOKEN"] = "1234567890:test_token";
 process.env["ENCRYPTION_KEY_HEX"] = "a".repeat(64);
-process.env["DB_PATH"] = ":memory:";
+// Use a file-backed database instead of an in-memory DB. This avoids native
+// better-sqlite3 crashes in CI when multiple worker processes or SQLite lifecycle
+// edge cases are involved while keeping the database isolated to this test run.
+process.env["DB_PATH"] = join(tmpdir(), `sendgram-test-${process.pid}.db`);
 process.env["MAX_TRANSFER_AMOUNT"] = "100";
 process.env["MAX_DAILY_AMOUNT"] = "500";
 process.env["CLAIM_EXPIRY_HOURS"] = "72";
