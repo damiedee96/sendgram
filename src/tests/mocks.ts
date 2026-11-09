@@ -6,7 +6,7 @@
 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { vi } from "vitest";
+import { afterAll, vi } from "vitest";
 
 // ---------------------------------------------------------------------------
 // Environment setup — must come before any config import
@@ -25,6 +25,11 @@ process.env["RATE_LIMIT_MAX"] = "10";
 process.env["RATE_LIMIT_WINDOW_SECONDS"] = "60";
 process.env["USDC_ASSET_CODE"] = "USDC";
 process.env["USDC_ASSET_ISSUER"] = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+afterAll(async () => {
+  const { _resetDb } = await import("../db.js");
+  _resetDb();
+});
 
 // ---------------------------------------------------------------------------
 // Mock Telegram context factory

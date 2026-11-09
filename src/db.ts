@@ -68,8 +68,9 @@ export function getDb(): Database.Database {
   return _db;
 }
 
-// For tests: allow resetting the singleton (in-memory dbs)
+// For tests: close and reset the singleton.
 export function _resetDb(): void {
+  _db?.close();
   _db = null;
 }
 
